@@ -3,12 +3,26 @@
 # found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 cmake_minimum_required(VERSION 3.9)
-project(Leveldb VERSION 0.1.0 LANGUAGES C CXX)
+# Keep the version below in sync with the one in db.h
+project(leveldb VERSION 1.22.0 LANGUAGES C CXX)
 
-# This project can take advantage of C++11.
+# This project can use C11, but will gracefully decay down to C89.
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED OFF)
+set(CMAKE_C_EXTENSIONS OFF)
+
+# This project requires C++11.
 set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if (WIN32)
+  set(LEVELDB_PLATFORM_NAME LEVELDB_PLATFORM_WINDOWS)
+  # TODO(cmumford): Make UNICODE configurable for Windows.
+  add_definitions(-D_UNICODE -DUNICODE)
+else (WIN32)
+  set(LEVELDB_PLATFORM_NAME LEVELDB_PLATFORM_POSIX)
+endif (WIN32)
 
 option(LEVELDB_BUILD_TESTS "Build LevelDB's unit tests" ON)
 option(LEVELDB_BUILD_BENCHMARKS "Build LevelDB's benchmarks" ON)
@@ -20,16 +34,44 @@ test_big_endian(LEVELDB_IS_BIG_ENDIAN)
 include(CheckIncludeFile)
 check_include_file("unistd.h" HAVE_UNISTD_H)
 
-include(CheckIncludeFileCXX)
-check_include_file_cxx("atomic" LEVELDB_ATOMIC_PRESENT)
-
 include(CheckLibraryExists)
 check_library_exists(crc32c crc32c_value "" HAVE_CRC32C)
 check_library_exists(snappy snappy_compress "" HAVE_SNAPPY)
 check_library_exists(tcmalloc malloc "" HAVE_TCMALLOC)
 
-include(CheckSymbolExists)
-check_symbol_exists(fdatasync "unistd.h" HAVE_FDATASYNC)
+include(CheckCXXSymbolExists)
+# Using check_cxx_symbol_exists() instead of check_c_symbol_exists() because
+# we're including the header from C++, and feature detection should use the same
+# compiler language that the project will use later. Principles aside, some
+# versions of do not expose fdatasync() in <unistd.h> in standard C mode
+# (-std=c11), but do expose the function in standard C++ mode (-std=c++11).
+check_cxx_symbol_exists(fdatasync "unistd.h" HAVE_FDATASYNC)
+check_cxx_symbol_exists(F_FULLFSYNC "fcntl.h" HAVE_FULLFSYNC)
+check_cxx_symbol_exists(O_CLOEXEC "fcntl.h" HAVE_O_CLOEXEC)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  # Disable C++ exceptions.
+  string(REGEX REPLACE "/EH[a-z]+" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c-")
+  add_definitions(-D_HAS_EXCEPTIONS=0)
+
+  # Disable RTTI.
+  string(REGEX REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
+else(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  # Enable strict prototype warnings for C code in clang and gcc.
+  if(NOT CMAKE_C_FLAGS MATCHES "-Wstrict-prototypes")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wstrict-prototypes")
+  endif(NOT CMAKE_C_FLAGS MATCHES "-Wstrict-prototypes")
+
+  # Disable C++ exceptions.
+  string(REGEX REPLACE "-fexceptions" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
+
+  # Disable RTTI.
+  string(REGEX REPLACE "-frtti" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+endif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 
 include(CheckCXXSourceCompiles)
 
@@ -51,6 +93,14 @@ int main() { return 0; }
 "  HAVE_CLANG_THREAD_SAFETY)
 set(CMAKE_REQUIRED_FLAGS ${OLD_CMAKE_REQUIRED_FLAGS})
 
+# Test whether C++17 __has_include is available.
+check_cxx_source_compiles("
+#if defined(__has_include) &&  __has_include(<string>)
+#include <string>
+#endif
+int main() { std::string str; return 0; }
+" HAVE_CXX17_HAS_INCLUDE)
+
 set(LEVELDB_PUBLIC_INCLUDE_DIR "include/leveldb")
 set(LEVELDB_PORT_CONFIG_DIR "include/port")
 
@@ -69,27 +119,10 @@ if(BUILD_SHARED_LIBS)
   add_compile_options(-fvisibility=hidden)
 endif(BUILD_SHARED_LIBS)
 
-# POSIX code is specified separately so we can leave it out in the future.
-add_library(leveldb_port_posix OBJECT "")
-target_sources(leveldb_port_posix
-  PRIVATE
-    "${PROJECT_SOURCE_DIR}/port/port_posix.cc"
-
-  PUBLIC
-    # The headers below are dependencies for leveldb, but aren't needed by users
-    # that link to the installed version of leveldb and rely on its public API.
-    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/${LEVELDB_PORT_CONFIG_DIR}/port_config.h>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/port/atomic_pointer.h>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/port/port_posix.h>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/port/port.h>
-)
-if(BUILD_SHARED_LIBS)
-  set_property(TARGET leveldb_port_posix PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif(BUILD_SHARED_LIBS)
-
 add_library(leveldb "")
 target_sources(leveldb
   PRIVATE
+    "${PROJECT_BINARY_DIR}/${LEVELDB_PORT_CONFIG_DIR}/port_config.h"
     "${PROJECT_SOURCE_DIR}/db/builder.cc"
     "${PROJECT_SOURCE_DIR}/db/builder.h"
     "${PROJECT_SOURCE_DIR}/db/c.cc"
@@ -120,6 +153,7 @@ target_sources(leveldb
     "${PROJECT_SOURCE_DIR}/db/version_set.h"
     "${PROJECT_SOURCE_DIR}/db/write_batch_internal.h"
     "${PROJECT_SOURCE_DIR}/db/write_batch.cc"
+    "${PROJECT_SOURCE_DIR}/port/port_stdcxx.h"
     "${PROJECT_SOURCE_DIR}/port/port.h"
     "${PROJECT_SOURCE_DIR}/port/thread_annotations.h"
     "${PROJECT_SOURCE_DIR}/table/block_builder.cc"
@@ -147,7 +181,6 @@ target_sources(leveldb
     "${PROJECT_SOURCE_DIR}/util/comparator.cc"
     "${PROJECT_SOURCE_DIR}/util/crc32c.cc"
     "${PROJECT_SOURCE_DIR}/util/crc32c.h"
-    "${PROJECT_SOURCE_DIR}/util/env_posix.cc"
     "${PROJECT_SOURCE_DIR}/util/env.cc"
     "${PROJECT_SOURCE_DIR}/util/filter_policy.cc"
     "${PROJECT_SOURCE_DIR}/util/hash.cc"
@@ -155,11 +188,10 @@ target_sources(leveldb
     "${PROJECT_SOURCE_DIR}/util/logging.cc"
     "${PROJECT_SOURCE_DIR}/util/logging.h"
     "${PROJECT_SOURCE_DIR}/util/mutexlock.h"
+    "${PROJECT_SOURCE_DIR}/util/no_destructor.h"
     "${PROJECT_SOURCE_DIR}/util/options.cc"
-    "${PROJECT_SOURCE_DIR}/util/posix_logger.h"
     "${PROJECT_SOURCE_DIR}/util/random.h"
     "${PROJECT_SOURCE_DIR}/util/status.cc"
-    $<TARGET_OBJECTS:leveldb_port_posix>
 
   # Only CMake 3.3+ supports PUBLIC sources in targets exported by "install".
   $<$<VERSION_GREATER:CMAKE_VERSION,3.2>:PUBLIC>
@@ -169,6 +201,7 @@ target_sources(leveldb
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/db.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/dumpfile.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/env.h"
+    "${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/options.h"
@@ -178,24 +211,51 @@ target_sources(leveldb
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/table.h"
     "${LEVELDB_PUBLIC_INCLUDE_DIR}/write_batch.h"
 )
+
+if (WIN32)
+  target_sources(leveldb
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/util/env_windows.cc"
+      "${PROJECT_SOURCE_DIR}/util/windows_logger.h"
+  )
+else (WIN32)
+  target_sources(leveldb
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/util/env_posix.cc"
+      "${PROJECT_SOURCE_DIR}/util/posix_logger.h"
+  )
+endif (WIN32)
+
 # MemEnv is not part of the interface and could be pulled to a separate library.
 target_sources(leveldb
   PRIVATE
     "${PROJECT_SOURCE_DIR}/helpers/memenv/memenv.cc"
     "${PROJECT_SOURCE_DIR}/helpers/memenv/memenv.h"
 )
+
 target_include_directories(leveldb
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+
+set_target_properties(leveldb
+  PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+
 target_compile_definitions(leveldb
   PRIVATE
     # Used by include/export.h when building shared libraries.
     LEVELDB_COMPILE_LIBRARY
     # Used by port/port.h.
-    LEVELDB_PLATFORM_POSIX=1
+    ${LEVELDB_PLATFORM_NAME}=1
 )
+if (NOT HAVE_CXX17_HAS_INCLUDE)
+  target_compile_definitions(leveldb
+    PRIVATE
+      LEVELDB_HAS_PORT_CONFIG_H=1
+  )
+endif(NOT HAVE_CXX17_HAS_INCLUDE)
+
 if(BUILD_SHARED_LIBS)
   target_compile_definitions(leveldb
     PUBLIC
@@ -210,11 +270,6 @@ if(HAVE_CLANG_THREAD_SAFETY)
       -Werror -Wthread-safety)
 endif(HAVE_CLANG_THREAD_SAFETY)
 
-# TODO(costan): This is only needed for port_posix.
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_package(Threads REQUIRED)
-target_link_libraries(leveldb Threads::Threads)
-
 if(HAVE_CRC32C)
   target_link_libraries(leveldb crc32c)
 endif(HAVE_CRC32C)
@@ -224,6 +279,10 @@ endif(HAVE_SNAPPY)
 if(HAVE_TCMALLOC)
   target_link_libraries(leveldb tcmalloc)
 endif(HAVE_TCMALLOC)
+
+# Needed by port_stdcxx.h
+find_package(Threads REQUIRED)
+target_link_libraries(leveldb Threads::Threads)
 
 add_executable(leveldbutil
   "${PROJECT_SOURCE_DIR}/db/leveldbutil.cc"
@@ -247,19 +306,17 @@ if(LEVELDB_BUILD_TESTS)
 
         "${test_file}"
     )
-    if(BUILD_SHARED_LIBS)
-      # Port functions aren't exposed in the shared library build.
-      target_sources("${test_target_name}"
-        PRIVATE
-          $<TARGET_OBJECTS:leveldb_port_posix>
-      )
-    endif(BUILD_SHARED_LIBS)
-
     target_link_libraries("${test_target_name}" leveldb)
     target_compile_definitions("${test_target_name}"
       PRIVATE
-        LEVELDB_PLATFORM_POSIX=1
+        ${LEVELDB_PLATFORM_NAME}=1
     )
+    if (NOT HAVE_CXX17_HAS_INCLUDE)
+      target_compile_definitions("${test_target_name}"
+        PRIVATE
+          LEVELDB_HAS_PORT_CONFIG_H=1
+      )
+    endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
     add_test(NAME "${test_target_name}" COMMAND "${test_target_name}")
   endfunction(leveldb_test)
@@ -269,8 +326,11 @@ if(LEVELDB_BUILD_TESTS)
 
   leveldb_test("${PROJECT_SOURCE_DIR}/issues/issue178_test.cc")
   leveldb_test("${PROJECT_SOURCE_DIR}/issues/issue200_test.cc")
+  leveldb_test("${PROJECT_SOURCE_DIR}/issues/issue320_test.cc")
 
   leveldb_test("${PROJECT_SOURCE_DIR}/util/env_test.cc")
+  leveldb_test("${PROJECT_SOURCE_DIR}/util/status_test.cc")
+  leveldb_test("${PROJECT_SOURCE_DIR}/util/no_destructor_test.cc")
 
   if(NOT BUILD_SHARED_LIBS)
     leveldb_test("${PROJECT_SOURCE_DIR}/db/autocompact_test.cc")
@@ -296,10 +356,15 @@ if(LEVELDB_BUILD_TESTS)
     leveldb_test("${PROJECT_SOURCE_DIR}/util/coding_test.cc")
     leveldb_test("${PROJECT_SOURCE_DIR}/util/crc32c_test.cc")
     leveldb_test("${PROJECT_SOURCE_DIR}/util/hash_test.cc")
+    leveldb_test("${PROJECT_SOURCE_DIR}/util/logging_test.cc")
 
     # TODO(costan): This test also uses
-    #               "${PROJECT_SOURCE_DIR}/util/env_posix_test_helper.h"
-    leveldb_test("${PROJECT_SOURCE_DIR}/util/env_posix_test.cc")
+    #               "${PROJECT_SOURCE_DIR}/util/env_{posix|windows}_test_helper.h"
+    if (WIN32)
+      leveldb_test("${PROJECT_SOURCE_DIR}/util/env_windows_test.cc")
+    else (WIN32)
+      leveldb_test("${PROJECT_SOURCE_DIR}/util/env_posix_test.cc")
+    endif (WIN32)
   endif(NOT BUILD_SHARED_LIBS)
 endif(LEVELDB_BUILD_TESTS)
 
@@ -320,28 +385,26 @@ if(LEVELDB_BUILD_BENCHMARKS)
 
         "${bench_file}"
     )
-    if(BUILD_SHARED_LIBS)
-      # Port functions aren't exposed in the shared library build.
-      target_sources("${bench_target_name}"
-        PRIVATE
-          $<TARGET_OBJECTS:leveldb_port_posix>
-      )
-    endif(BUILD_SHARED_LIBS)
-
     target_link_libraries("${bench_target_name}" leveldb)
     target_compile_definitions("${bench_target_name}"
       PRIVATE
-        LEVELDB_PLATFORM_POSIX=1
+        ${LEVELDB_PLATFORM_NAME}=1
     )
+    if (NOT HAVE_CXX17_HAS_INCLUDE)
+      target_compile_definitions("${bench_target_name}"
+        PRIVATE
+          LEVELDB_HAS_PORT_CONFIG_H=1
+      )
+    endif(NOT HAVE_CXX17_HAS_INCLUDE)
   endfunction(leveldb_benchmark)
 
   if(NOT BUILD_SHARED_LIBS)
-    leveldb_benchmark("${PROJECT_SOURCE_DIR}/db/db_bench.cc")
+    leveldb_benchmark("${PROJECT_SOURCE_DIR}/benchmarks/db_bench.cc")
   endif(NOT BUILD_SHARED_LIBS)
 
   check_library_exists(sqlite3 sqlite3_open "" HAVE_SQLITE3)
   if(HAVE_SQLITE3)
-    leveldb_benchmark("${PROJECT_SOURCE_DIR}/doc/bench/db_bench_sqlite3.cc")
+    leveldb_benchmark("${PROJECT_SOURCE_DIR}/benchmarks/db_bench_sqlite3.cc")
     target_link_libraries(db_bench_sqlite3 sqlite3)
   endif(HAVE_SQLITE3)
 
@@ -361,7 +424,7 @@ int main() {
   "  HAVE_KYOTOCABINET)
   set(CMAKE_REQUIRED_LIBRARIES ${OLD_CMAKE_REQURED_LIBRARIES})
   if(HAVE_KYOTOCABINET)
-    leveldb_benchmark("${PROJECT_SOURCE_DIR}/doc/bench/db_bench_tree_db.cc")
+    leveldb_benchmark("${PROJECT_SOURCE_DIR}/benchmarks/db_bench_tree_db.cc")
     target_link_libraries(db_bench_tree_db kyotocabinet)
   endif(HAVE_KYOTOCABINET)
 endif(LEVELDB_BUILD_BENCHMARKS)
@@ -369,7 +432,7 @@ endif(LEVELDB_BUILD_BENCHMARKS)
 if(LEVELDB_INSTALL)
   include(GNUInstallDirs)
   install(TARGETS leveldb
-    EXPORT LeveldbTargets
+    EXPORT leveldbTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -382,6 +445,7 @@ if(LEVELDB_INSTALL)
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/db.h"
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/dumpfile.h"
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/env.h"
+      "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/export.h"
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/filter_policy.h"
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/iterator.h"
       "${PROJECT_SOURCE_DIR}/${LEVELDB_PUBLIC_INCLUDE_DIR}/options.h"
@@ -395,18 +459,18 @@ if(LEVELDB_INSTALL)
 
   include(CMakePackageConfigHelpers)
   write_basic_package_version_file(
-      "${PROJECT_BINARY_DIR}/LeveldbConfigVersion.cmake"
+      "${PROJECT_BINARY_DIR}/leveldbConfigVersion.cmake"
       COMPATIBILITY SameMajorVersion
   )
   install(
-    EXPORT LeveldbTargets
-    NAMESPACE Leveldb::
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Leveldb"
+    EXPORT leveldbTargets
+    NAMESPACE leveldb::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/leveldb"
   )
   install(
     FILES
-      "${PROJECT_SOURCE_DIR}/cmake/LeveldbConfig.cmake"
-      "${PROJECT_BINARY_DIR}/LeveldbConfigVersion.cmake"
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Leveldb"
+      "${PROJECT_SOURCE_DIR}/cmake/leveldbConfig.cmake"
+      "${PROJECT_BINARY_DIR}/leveldbConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/leveldb"
   )
 endif(LEVELDB_INSTALL)
